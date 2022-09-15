@@ -10,12 +10,14 @@ Biases <https://www.wandb.com/>`__ and also saves them to the file
 ``log.txt``.
 
 .. testsetup::
+    :skipif: not _WANDB_INSTALLED
 
     import os
 
     os.environ["WANDB_MODE"] = "disabled"
 
 .. testcode::
+    :skipif: not _WANDB_INSTALLED
 
     from composer import Trainer
     from composer.loggers import WandBLogger, FileLogger
@@ -31,6 +33,7 @@ Biases <https://www.wandb.com/>`__ and also saves them to the file
     )
 
 .. testcleanup::
+    :skipif: not _WANDB_INSTALLED
 
     trainer.engine.close()
     os.remove("log.txt")
@@ -45,6 +48,7 @@ Available Loggers
 
     ~file_logger.FileLogger
     ~wandb_logger.WandBLogger
+    ~cometml_logger.CometMLLogger
     ~progress_bar_logger.ProgressBarLogger
     ~tensorboard_logger.TensorboardLogger
     ~in_memory_logger.InMemoryLogger
