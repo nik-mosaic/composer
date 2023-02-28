@@ -3,12 +3,14 @@
 
 import logging
 import textwrap
+import warnings
 
 import torch
 import torch.nn.utils.parametrize as parametrize
 from torch import nn
 from torch.fx import symbolic_trace
 
+from composer.algorithms.warnings import NoEffectWarning
 from composer.core import Algorithm, Event, State
 from composer.loggers import Logger
 from composer.utils import module_surgery
@@ -69,6 +71,12 @@ def apply_weight_standardization(module: torch.nn.Module, n_last_layers_ignore: 
         if isinstance(m, modules_to_parametrize):
             parametrize.register_parametrization(m, 'weight', WeightStandardizer())
             current_ws_count += 1
+
+    if current_ws_count == 0:
+        warnings.warn(
+            NoEffectWarning(
+                'Applying Weight Standardization had no effect on the model. No instances of torch.nn.Con1d, torch.nn.Conv2d, or torch.nn.Conv3d found.'
+            ))
 
     return current_ws_count
 

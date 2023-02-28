@@ -3,11 +3,13 @@
 
 import logging
 import math
+import warnings
 from typing import Optional, Sequence, Union
 
 import torch
 from torch.optim import Optimizer
 
+from composer.algorithms.warnings import NoEffectWarning
 from composer.core import Algorithm, Event, State
 from composer.loggers import Logger
 from composer.utils import module_surgery
@@ -102,6 +104,12 @@ class GhostBatchNorm(Algorithm):
         num_new_modules = module_surgery.count_module_instances(state.model, _GhostBatchNorm)
         classname = 'GhostBatchNorm'
         module_name = 'GhostBatchNorm'
+
+        if num_new_modules == 0:
+            warnings.warn(
+                NoEffectWarning('GhostBatchNorm had no effect on the model. \
+            No modules of type torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, or torch.nn.BatchNorm3d found.'))
+            return
 
         # python logger
         log.info(f'Applied {classname} to model {state.model.__class__.__name__} '

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import Optional, Sequence, Type, Union, cast
 
 import torch
@@ -11,6 +12,7 @@ from torch.optim import Optimizer
 
 from composer.algorithms.factorize.factorize_modules import (FactorizedConv2d, FactorizedLinear,
                                                              factorizing_could_speedup)
+from composer.algorithms.warnings import NoEffectWarning
 from composer.core import Algorithm, Event, State
 from composer.loggers import Logger
 from composer.utils import module_surgery
@@ -79,16 +81,21 @@ def apply_factorization(model: torch.nn.Module,
             model = models.resnet50()
             cf.apply_factorization(model)
     """
+    count = 0
     if factorize_convs:
-        _factorize_conv2d_modules(model,
-                                  min_channels=min_channels,
-                                  latent_channels=latent_channels,
-                                  optimizers=optimizers)
+        replaced_pairs = _factorize_conv2d_modules(model,
+                                                   min_channels=min_channels,
+                                                   latent_channels=latent_channels,
+                                                   optimizers=optimizers)
+        count += len(replaced_pairs)
     if factorize_linears:
-        _factorize_linear_modules(model,
-                                  min_features=min_features,
-                                  latent_features=latent_features,
-                                  optimizers=optimizers)
+        replaced_pairs = _factorize_linear_modules(model,
+                                                   min_features=min_features,
+                                                   latent_features=latent_features,
+                                                   optimizers=optimizers)
+        count += len(replaced_pairs)
+    if count == 0:
+        warnings.warn(NoEffectWarning(f'Factorize had no effect on the model! No Conv2d or Linear modules found!'))
 
 
 class Factorize(Algorithm):

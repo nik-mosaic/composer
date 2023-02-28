@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import Optional, Sequence, Union
 
 import torch
 from torch.optim import Optimizer
 
+from composer.algorithms.warnings import NoEffectWarning
 from composer.core import Algorithm, Event, State
 from composer.loggers import Logger
 from composer.utils import module_surgery
@@ -68,7 +70,13 @@ def apply_squeeze_excite(
         if min(module.in_channels, module.out_channels) >= min_channels and not already_squeeze_excited:
             return SqueezeExciteConv2d.from_conv2d(module, module_index, latent_channels=latent_channels)
 
-    module_surgery.replace_module_classes(model, optimizers=optimizers, policies={torch.nn.Conv2d: convert_module})
+    replaced_pairs = module_surgery.replace_module_classes(model,
+                                                           optimizers=optimizers,
+                                                           policies={torch.nn.Conv2d: convert_module})
+    if len(replaced_pairs) == 0:
+        warnings.warn(
+            NoEffectWarning(
+                'Applying Squeeze Excite had no effect on the model. No instances of torch.nn.Conv2d found.'))
 
 
 class SqueezeExcite2d(torch.nn.Module):

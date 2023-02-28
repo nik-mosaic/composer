@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import functools
 import logging
+import warnings
 from typing import Optional, Type, Union
 
 import torch
 from torchvision.models.resnet import Bottleneck
 
 from composer.algorithms.stochastic_depth.stochastic_layers import make_resnet_bottleneck_stochastic
+from composer.algorithms.warnings import NoEffectWarning
 from composer.core import Algorithm, Event, State
 from composer.core.time import Time, TimeUnit
 from composer.loggers import Logger
@@ -91,7 +93,11 @@ def apply_stochastic_depth(model: torch.nn.Module,
                                                      module_count=module_count,
                                                      stochastic_method=stochastic_method)
     transforms[target_layer] = stochastic_from_target_layer
-    module_surgery.replace_module_classes(model, policies=transforms)
+    replaced_pairs = module_surgery.replace_module_classes(model, policies=transforms)
+    if len(replaced_pairs) == 0:
+        warnings.warn(
+            NoEffectWarning(
+                'Applying Stochastic Depth had no effect on the model. No instances of torch.nn.Conv2d found.'))
 
 
 class StochasticDepth(Algorithm):
