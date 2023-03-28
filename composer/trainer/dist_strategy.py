@@ -17,7 +17,7 @@ from torchmetrics import Metric, MetricCollection
 from composer.core import Precision
 from composer.core.state import State
 from composer.trainer.meta_safe_apply import meta_safe_apply
-from composer.utils import StringEnum, dist, ensure_tuple
+from composer.utils import StringEnum, dist, ensure_tuple, using_torch_2_0
 
 __all__ = ['DDPSyncStrategy', 'ddp_sync_context', 'prepare_ddp_module', 'prepare_fsdp_module']
 
@@ -123,23 +123,6 @@ def prepare_ddp_module(module: torch.nn.Module, find_unused_parameters: bool) ->
                        'with distributed support.')
 
 
-def get_torch_dtype(dtype: Union[Precision, str]):
-    """Convert common string representations of dtypes to torch dtypes."""
-    dtype = dtype.value if isinstance(dtype, Precision) else dtype
-    if dtype in ['float32', 'torch.float32', 'fp32']:
-        return torch.float32
-    elif dtype in ['float16', 'torch.float16', 'half', 'fp16', 'amp', 'amp_fp16']:
-        return torch.float16
-    elif dtype in ['bfloat16', 'bfloat', 'torch.bfloat16', 'bf16', 'amp_bf16']:
-        return torch.bfloat16
-    elif dtype in ['amp_fp8']:
-        # We use torch.bfloat16 by default for amp_fp8 as there is no
-        # fp8 datatype in PyTorch yet.
-        return torch.bfloat16
-    else:
-        raise ValueError(f'Not sure how to convert dtype={dtype} to a torch dtype.')
-
-
 def prepare_fsdp_module(model: torch.nn.Module, optimizers: Optional[Union[torch.optim.Optimizer,
                                                                            Sequence[torch.optim.Optimizer]]],
                         fsdp_config: Dict[str, Any], precision: Precision) -> None:
@@ -153,11 +136,16 @@ def prepare_fsdp_module(model: torch.nn.Module, optimizers: Optional[Union[torch
     """
     if version.parse(torch.__version__) < version.parse('1.13.0'):
         raise RuntimeError('To use FSDP with Composer, you must use torch>=1.13.0.')
-    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (apply_activation_checkpointing,
+    is_torch_2_0 = using_torch_2_0()
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (CheckpointImpl,
+                                                                             apply_activation_checkpointing,
                                                                              checkpoint_wrapper)
-    from torch.distributed.fsdp import (BackwardPrefetch, CPUOffload, FullyShardedDataParallel, MixedPrecision,
-                                        ShardingStrategy)
-    from torch.distributed.fsdp.flatten_params_wrapper import FlattenParamsWrapper
+    from torch.distributed.fsdp import FullyShardedDataParallel
+    if not is_torch_2_0:
+        from torch.distributed.fsdp.flatten_params_wrapper import FlattenParamsWrapper
+
+    from composer.trainer.mosaic_fsdp import (MosaicFullyShardedDataParallel, backward_prefetch_map, get_cpu_offload,
+                                              get_mixed_precision, sharding_map)
 
     if optimizers:
         optimizers_tuple = ensure_tuple(optimizers)
@@ -170,47 +158,16 @@ def prepare_fsdp_module(model: torch.nn.Module, optimizers: Optional[Union[torch
         optim.param_groups.clear()
         optim.state.clear()
 
-    sharding_map = {
-        'NO_SHARD': ShardingStrategy.NO_SHARD,
-        'SHARD_GRAD_OP': ShardingStrategy.SHARD_GRAD_OP,
-        'FULL_SHARD': ShardingStrategy.FULL_SHARD,
-    }
     sharding_map_key = fsdp_config.get('sharding_strategy', 'FULL_SHARD').upper()
     sharding_strategy = sharding_map[sharding_map_key]
 
-    cpu_offload = CPUOffload(offload_params=True) if fsdp_config.get('cpu_offload', False) else None
-    if cpu_offload is not None:
-        raise ValueError('FSDP CPU Offload not supported yet.')
+    cpu_offload = get_cpu_offload(cpu_offload=fsdp_config.get('cpu_offload', False))
 
     mixed_precision = fsdp_config.get('mixed_precision', 'DEFAULT')
-    param_dtype = None
-    reduce_dtype = None
-    buffer_dtype = None
-    if isinstance(mixed_precision, dict):
-        param_dtype = mixed_precision.get('param_dtype', None)
-        if param_dtype is not None:
-            param_dtype = get_torch_dtype(param_dtype)
-        reduce_dtype = mixed_precision.get('reduce_dtype', None)
-        if reduce_dtype is not None:
-            reduce_dtype = get_torch_dtype(reduce_dtype)
-        buffer_dtype = mixed_precision.get('buffer_dtype', None)
-        if buffer_dtype is not None:
-            buffer_dtype = get_torch_dtype(buffer_dtype)
-    elif isinstance(mixed_precision, str):
-        mixed_precision = mixed_precision.upper()
-        if mixed_precision == 'FULL':
-            pass
-        elif mixed_precision == 'DEFAULT':
-            reduce_dtype = get_torch_dtype(precision)
-            buffer_dtype = torch.float32
-        elif mixed_precision == 'PURE':
-            param_dtype = get_torch_dtype(precision)
-            reduce_dtype = get_torch_dtype(precision)
-            buffer_dtype = get_torch_dtype(precision)
-        else:
-            raise ValueError(f'Unable to interpret mixed_precision={mixed_precision}')
-    else:
-        raise ValueError(f'Unable to interpret mixed_precision={mixed_precision}')
+    keep_low_precision_grads = fsdp_config.get('keep_low_precision_grads', False)
+    mixed_precision, param_dtype, _, _ = get_mixed_precision(precision,
+                                                             mixed_precision=mixed_precision,
+                                                             keep_low_precision_grads=keep_low_precision_grads)
 
     # Note: FSDP does support the use of torch.float32 with sharding.
     # They just never expected a user to pass in torch.float32 into mixed_precision as a param_dtype.
@@ -232,20 +189,6 @@ def prepare_fsdp_module(model: torch.nn.Module, optimizers: Optional[Union[torch
                 f'Consider using `amp` or `bf16` for precision or setting param_dtype in mixed_precision to `None` '
                 f'with sharding strategy `{sharding_map_key}.`')
 
-    keep_low_precision_grads = fsdp_config.get('keep_low_precision_grads', False)
-
-    mixed_precision = MixedPrecision(
-        param_dtype=param_dtype,
-        reduce_dtype=reduce_dtype,
-        buffer_dtype=buffer_dtype,
-        keep_low_precision_grads=keep_low_precision_grads,
-    )
-
-    backward_prefetch_map = {
-        'NONE': None,
-        'BACKWARD_PRE': BackwardPrefetch.BACKWARD_PRE,
-        'BACKWARD_POST': BackwardPrefetch.BACKWARD_POST,
-    }
     backward_prefetch = backward_prefetch_map[fsdp_config.get('backward_prefetch', 'BACKWARD_POST').upper()]
     min_params = int(float(fsdp_config.get('min_params', 1e9)))
     activation_checkpointing = fsdp_config.get('activation_checkpointing', False)
@@ -255,6 +198,7 @@ def prepare_fsdp_module(model: torch.nn.Module, optimizers: Optional[Union[torch
     limit_all_gathers = fsdp_config.get('limit_all_gathers', False)
     ignored_modules = fsdp_config.get('ignored_modules', None)
     state_dict_type = fsdp_config.get('state_dict_type', 'full')
+    activation_checkpointing_reentrant = fsdp_config.get('activation_checkpointing_reentrant', True)
 
     # We choose to not wrap the ComposerModel directly, but instead wrap any submodules like `ComposerModel.model`
     # This makes it safer to call ComposerModel-specific functions like 'eval_forward' that
@@ -262,6 +206,10 @@ def prepare_fsdp_module(model: torch.nn.Module, optimizers: Optional[Union[torch
     # to a FSDP-wrapped submodule's `forward()` function will be safe and all-gather the necessary weights before `forward()`.
     for obj_name, obj in model.named_children():
         if not isinstance(obj, (Metric, MetricCollection)):
+
+            # Skip wrapping submodules which are explicitly marked with no wrap
+            if hasattr(obj, '_fsdp_wrap') and not bool(obj._fsdp_wrap):
+                continue
 
             def _param_init_fn(module: torch.nn.Module) -> None:
                 # A dictionary of all tied parameter pointers to module names
@@ -333,20 +281,34 @@ def prepare_fsdp_module(model: torch.nn.Module, optimizers: Optional[Union[torch
             # If module has attribute `module._fsdp_wrap = ...`, always respect it
             # Otherwise wrap if root object `obj.fsdp_wrap_fn(module)` is true
             # Or if unwrapped params in module in greater than or equal to fsdp_config.min_params
-            def _auto_wrap_policy(module: torch.nn.Module, recurse: bool, unwrapped_params: int) -> bool:
+            def __auto_wrap_policy(module: torch.nn.Module, recurse: bool, nonwrapped_numel: int) -> bool:
                 if recurse:
                     return True
                 else:
                     if hasattr(module, '_fsdp_wrap'):
                         return bool(module._fsdp_wrap)
 
-                    is_large = unwrapped_params >= min_params
+                    is_large = nonwrapped_numel >= min_params
                     if hasattr(obj, 'fsdp_wrap_fn') and isinstance(obj.fsdp_wrap_fn, Callable):
                         return obj.fsdp_wrap_fn(module) or is_large
                     else:
                         return is_large
 
-            fsdp_obj = FullyShardedDataParallel(
+            if is_torch_2_0:
+
+                def _auto_wrap_policy_new(module: torch.nn.Module, recurse: bool, nonwrapped_numel: int) -> bool:
+                    return __auto_wrap_policy(module, recurse, nonwrapped_numel)
+
+                _auto_wrap_policy = _auto_wrap_policy_new
+
+            else:
+
+                def _auto_wrap_policy_old(module: torch.nn.Module, recurse: bool, unwrapped_params: int) -> bool:
+                    return __auto_wrap_policy(module, recurse, unwrapped_params)
+
+                _auto_wrap_policy = _auto_wrap_policy_old
+
+            fsdp_obj = MosaicFullyShardedDataParallel(
                 obj,
                 sharding_strategy=sharding_strategy,
                 auto_wrap_policy=_auto_wrap_policy,
@@ -363,15 +325,29 @@ def prepare_fsdp_module(model: torch.nn.Module, optimizers: Optional[Union[torch
 
             # Activation Checkpointing
             if activation_checkpointing or activation_cpu_offload:
-                first_wrap_fn = checkpoint_wrapper if activation_checkpointing else (lambda module: module)
-                second_wrap_fn = (lambda module: checkpoint_wrapper(first_wrap_fn(module), offload_to_cpu=True)
-                                 ) if activation_cpu_offload else first_wrap_fn
+                if not activation_checkpointing_reentrant:
+                    first_wrap_fn = lambda m: checkpoint_wrapper(m, checkpoint_impl=CheckpointImpl.NO_REENTRANT
+                                                                ) if activation_checkpointing else (lambda module:
+                                                                                                    module)
+                    second_wrap_fn = (
+                        lambda module: checkpoint_wrapper(
+                            first_wrap_fn(module),  # type: ignore reportGeneralTypeIssues
+                            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                            offload_to_cpu=True)) if activation_cpu_offload else first_wrap_fn
+                else:
+                    first_wrap_fn = checkpoint_wrapper if activation_checkpointing else (lambda module: module)
+                    second_wrap_fn = (
+                        lambda module: checkpoint_wrapper(
+                            first_wrap_fn(module),  # type: ignore reportGeneralTypeIssues
+                            offload_to_cpu=True)) if activation_cpu_offload else first_wrap_fn
 
                 # Choose which modules to activation checkpoint according to the following priority:
                 # If module has attribute `module._activation_checkpointing = ...`, always respect it
                 # Otherwise checkpoint if root object `obj.activation_checkpointing_fn(module)` is true
                 def _check_fn(module: torch.nn.Module) -> bool:
-                    if isinstance(module, (FullyShardedDataParallel, FlattenParamsWrapper)):
+                    if not is_torch_2_0 and isinstance(module, FlattenParamsWrapper):
+                        return False
+                    if isinstance(module, FullyShardedDataParallel):
                         return False
                     if hasattr(module, '_activation_checkpointing'):
                         return bool(module._activation_checkpointing)
